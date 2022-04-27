@@ -1,0 +1,791 @@
+#!/bin/bash
+
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+
+printHelp() {
+    echo "corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+    echo
+    echo "Přepínače:"
+    echo "-h"
+    echo "      Tiskne nápovědu."
+    echo "FILTERS:"
+    echo "-a DATETIME"
+    echo "      Jsou uvažovány pouze záznamy po DATETIME (včetně tohoto data). DATETIME je ve formátu YYYY-MM-DD."
+    echo "-b DATETIME"
+    echo "      Jsou uvažovány pouze záznamy před DATETIME (včetně tohoto data)."
+    echo "-g GENDER"
+    echo "      Jsou uvažovány pouze záznamy osob daného pohlaví. GENDER může být: M (muži), Z (ženy)."
+    echo "-s [WIDTH]"
+    echo "      Výpis dat v podobě histogramu."
+    echo "      Nepovinný parametr WIDTH určuje délku nejdelšího řádku (neboli šířku histogramu), ostatní záznamy jsou v poměru dopočítány."
+    echo "      Pokud WIDTH není zadán, odpovídá každý # určitému počtu nákaz (počet nákaz na jeden # se liší podle příkazu)."
+    echo "COMMAND:"
+    echo "infected"
+    echo "      Spočítá počet nakažených."
+    echo "merge"
+    echo "      Sloučí několik souborů se záznamy do jednoho, zachovávající původní pořadí (hlavička bude ve výstupu jen jednou)."
+    echo "gender"
+    echo "      Vypíše počet nakažených pro jednotlivá pohlaví."
+    echo "age"
+    echo "      Vypíše statistiku počtu nakažených osob dle věku."
+    echo "daily"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé dny."
+    echo "monthly"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé měsíce."
+    echo "yearly"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé roky."
+    echo "countries"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé země nákazy. Nebere v potaz ČR."
+    echo "districts"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé okresy."
+    echo "regions"
+    echo "      Vypíše statistiku nakažených osob pro jednotlivé kraje."
+    exit 0
+}
+
+validateDate() {
+    if !([[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$1" >/dev/null 2>&1);
+    then 
+        echo "Invalid date: $1"
+    fi
+}
+
+echoerr() {
+    printf "%s\n" "$*" >&2;
+}
+
+calc() {
+    awk "BEGIN{print $*}";
+}
+
+round() {
+    echo "$1" | awk '{ printf("%d", $1) }'
+}
+
+findMax() {
+    if [ $1 -gt $2 ];
+    then echo $1
+    else echo $2
+    fi
+}
+
+printHash() {
+    printf "$1: "
+    if [ $2 -ge 1 ]; then
+        printf '%0.s#' $(seq 1 $2)
+    fi
+    echo
+}
+
+# $1-value; $2-change; $3-operation; $4-string
+makeLine() {
+    if [ "$3" == "*" ]; then
+        hashCount=$(calc $1*$2)
+        hashCount=$(round $hashCount)
+        printHash "$4" $hashCount
+    elif [ "$3" == "/" ]; then
+        hashCount=$(calc $1/$2)
+        hashCount=$(round $hashCount)
+        printHash "$4" $hashCount
+    else
+        echoerr "Wrong operation"
+    fi
+}
+
+dateAfter="0000-00-00"
+dateBefore="9999-99-99"
+gender="M|Z"
+graphWidth=""
+cmd=""
+logs=""
+zipLogs=""
+
+#get filters
+while getopts :ha:b:g:s: o
+do  case "$o" in
+    h)  printHelp;;
+    a)  validateDate $OPTARG
+        dateAfter=$OPTARG;;
+    b)  validateDate $OPTARG
+        dateBefore=$OPTARG;;
+    g)  if [ "$OPTARG" = "M" ];
+        then gender="M"
+        elif [ "$OPTARG" = "Z" ];
+        then gender="Z"
+        else
+            echoerr "Zadané neplatné pohlaví"
+            exit 1
+        fi;;
+    s)  if [[ "$OPTARG" =~ .*\.csv$ ]];
+        then 
+            logs="$logs $OPTARG"
+            graphWidth="default"
+        elif [[ "$OPTARG" =~ .*\.gz|bz2$ ]];
+        then 
+            zipLogs="$zipLogs $OPTARG"
+            graphWidth="default"
+        else
+            case "$OPTARG" in 
+            "") graphWidth="default";;
+            "infected") cmd=$OPTARG
+                graphWidth="default";;
+            "merge") cmd=$OPTARG
+                graphWidth="default";;
+            "gender") cmd=$OPTARG
+                graphWidth="default";;
+            "age") cmd=$OPTARG
+                graphWidth="default";;
+            "daily") cmd=$OPTARG
+                graphWidth="default";;
+            "monthly") cmd=$OPTARG
+                graphWidth="default";;
+            "yearly") cmd=$OPTARG
+                graphWidth="default";;
+            "countries") cmd=$OPTARG
+                graphWidth="default";;
+            "districts") cmd=$OPTARG
+                graphWidth="default";;
+            "regions") cmd=$OPTARG
+                graphWidth="default";;
+            *)
+                if (!([[ "$OPTARG" =~ ^[0-9]+$ ]]) || [ $OPTARG -le 0 ]);
+                then 
+                    echoerr "Šířka musí být celé kladné číslo"
+                    exit 1
+                fi
+                graphWidth=$OPTARG
+            esac
+        fi;;
+    *)  printHelp;;
+    esac
+done
+
+((OPTIND--))
+shift $OPTIND
+
+#get command if it has been entered
+#get input files
+while [ "$1" != "" ];
+do
+    if [[ "$1" =~ .*\.csv$ ]];
+    then
+        logs="$logs $1"
+    elif [[ "$1" =~ .*\.gz|bz2$ ]];
+    then
+        zipLogs="$zipLogs $1"
+    else
+        case "$1" in
+        "infected") cmd=$1;;
+        "merge") cmd=$1;;
+        "gender") cmd=$1;;
+        "age") cmd=$1;;
+        "daily") cmd=$1;;
+        "monthly") cmd=$1;;
+        "yearly") cmd=$1;;
+        "countries") cmd=$1;;
+        "districts") cmd=$1;;
+        "regions") cmd=$1;;
+        esac
+    fi
+    shift 1
+done
+
+#filtering the input based on given parameters
+readInput="cat -"
+if [ "$zipLogs" != "" ];
+then
+    if [[ "$zipLogs" =~ .*\.gz$ ]]; then
+        readInput="gzip -d -c $zipLogs | cat $logs -"
+    else
+        readInput="bzip2 -d -c $zipLogs | cat $logs -"
+    fi
+elif [ "$logs" != "" ];
+then
+    readInput="cat $logs"
+fi
+
+header="$readInput | head -n 1"
+#fix last and first line of 2 files combining into one
+readInput="$readInput |  awk '{ if(length(\$0) > 105) { print substr(\$0, 1, `expr \"length - 103\"`); print substr(\$0, `expr \"length - 102\"`, 103) } else { print } }'"
+copyInput="$readInput"
+#sorted input by date
+readInput="$readInput | sort -n -t\",\" -k2.1 -k2.5,2.6 -k2.9,2.0"
+
+if [ "$dateAfter" != "0000-00-00" ] || [ "$dateBefore" != "9999-99-99" ];
+then dateFilter="awk -F ',' '{ if((NF >= 2) && (\$2 > \"$dateAfter\") && (\$2 < \"$dateBefore\")) { print } }'"
+else dateFilter="cat -"
+fi
+genderFilter="awk -F ',' '{ if((NF < 4) || (\$4 == \"\") || (/^.*,.*,.*,($gender),.*$/)) { print } }'"
+filterInput="$readInput | $dateFilter | $genderFilter"
+
+#date checking
+printDates="$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) print \$2 }'"
+eval $printDates | while read date; do
+    validateDate $date          
+done
+
+#age checking
+eval "$filterInput | awk -F ',' '{ if((NF >= 3) && (!(\$3 ~ /^[0-9]+$/) && (\$3 != \"\"))) {print \"Invalid age:\", \$0 > \"/dev/stderr\" } }'"
+
+case "$cmd" in
+    "") 
+        eval $header
+        eval "$copyInput | $dateFilter | $genderFilter";;
+    "infected")
+        eval "$filterInput | wc -l";;
+    "merge")
+        eval "$header; $filterInput";;
+    "gender")
+    if [ "$graphWidth" == "" ]; then
+        if [ "$gender" == "M|Z" ];
+        then
+            genderFilter="grep -E '^.*,.*,.*,M,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            echo "M: $(eval "$filterInput | wc -l")"
+
+            genderFilter="grep -E '^.*,.*,.*,Z,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            echo "Z: $(eval "$filterInput | wc -l")"
+        elif [ "$gender" == "M" ]
+        then
+            genderFilter="grep -E '^.*,.*,.*,M,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            echo "M: $(eval "$filterInput | wc -l")"
+            echo "Z: 0"
+        elif [ "$gender" == "Z" ]
+        then
+            genderFilter="grep -E '^.*,.*,.*,M,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            echo "M: 0"
+            echo "Z: $(eval "$filterInput | wc -l")"
+        fi
+
+        genderFilter="awk -F ',' '{ if((NF < 4) || (\$4 == \"\")) { print } }'"
+        filterInput="$readInput | $dateFilter | $genderFilter"
+        count=$(eval "$filterInput | wc -l")
+
+        if [ $count -gt 0 ];
+        then echo "None: $count"
+        fi
+    else
+        defaultWidth=100000
+        if [ "$gender" == "M" ];
+        then
+            genderFilter="grep -E '^.*,.*,.*,M,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            maleCount=$(eval "$filterInput | wc -l")
+            if [ $maleCount -gt 0 ]; then
+                if [ "$graphWidth" == "default" ];
+                then
+                    if [ $maleCount -ge $defaultWidth ];
+                    then
+                        tmp=$(calc $maleCount/$defaultWidth)
+                        printHash "M" $tmp
+                    else
+                        echo "M: "
+                    fi
+                else
+
+                    printHash "M" $graphWidth
+                fi
+            else
+                echo "M: "
+            fi
+            echo "Z: "
+        elif [ "$gender" == "Z" ]
+        then
+            echo "M: "
+            genderFilter="grep -E '^.*,.*,.*,Z,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            femaleCount=$(eval "$filterInput | wc -l")
+            if [ $femaleCount -gt 0 ]; then
+                if [ "$graphWidth" == "default" ];
+                then
+                    if [ $femaleCount -ge $defaultWidth ];
+                    then
+                        tmp=$(calc $maleCount/$defaultWidth)
+                        printHash "Z" $tmp
+                    else
+                        echo "Z: "
+                    fi
+                else
+                    printHash "Z" $graphWidth
+                fi
+            else
+                echo "Z: "
+            fi
+            
+        else
+            genderFilter="grep -E '^.*,.*,.*,M,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            maleCount=$(eval "$filterInput | wc -l")
+
+            genderFilter="grep -E '^.*,.*,.*,Z,.*$'"
+            filterInput="$readInput | $dateFilter | $genderFilter"
+            femaleCount=$(eval "$filterInput | wc -l")
+            
+            if [ "$graphWidth" != "default" ]; then
+                max=$(findMax $maleCount $femaleCount)
+                change=$(calc $graphWidth/$max)
+                
+                makeLine $maleCount $change "*" "M"
+                makeLine $femaleCount $change "*" "Z"
+            else
+                makeLine $maleCount $defaultWidth "/" "M"
+                makeLine $femaleCount $defaultWidth "/" "Z"
+            fi
+
+        fi 
+
+        genderFilter="awk -F ',' '{ if((NF < 4) || (\$4 == \"\")) { print } }'"
+        filterInput="$readInput | $dateFilter | $genderFilter"
+        noneCount=$(eval "$filterInput | wc -l")
+
+        if [ $noneCount -gt 0 ]; then
+            if [ "$graphWidth" == "default" ]; then
+                makeLine $noneCount $defaultWidth "/" "None"
+            else
+                makeLine $noneCount $change "*" "None"
+            fi
+        fi       
+    fi;;
+    "age")
+        ageLow=0
+        ageHigh=5
+        group0=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=6
+        ageHigh=15
+        group1=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=16
+        ageHigh=25
+        group2=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+        
+        ageLow=26
+        ageHigh=35
+        group3=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=36
+        ageHigh=45
+        group4=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=46
+        ageHigh=55
+        group5=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=56
+        ageHigh=65
+        group6=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=66
+        ageHigh=75
+        group7=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=76
+        ageHigh=85
+        group8=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=86
+        ageHigh=95
+        group9=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=96
+        ageHigh=105
+        group10=$(eval "$filterInput | awk -F ',' '{ if((\$3 >= $ageLow) && (\$3 <= $ageHigh)) { print } }' | wc -l")
+
+        ageLow=106
+        group11=$(eval "$filterInput | awk -F ',' '{ if(\$3 >= $ageLow) { print } }' | wc -l")
+
+        groupNone=$(eval "$filterInput | awk -F ',' '{ if((NF < 3) || (\$3 == \"\")) { print } }' | wc -l")
+
+    if [ "$graphWidth" == "" ]; then
+        echo "0-5   : $group0"
+        echo "6-15  : $group1"
+        echo "16-25 : $group2"
+        echo "26-35 : $group3"
+        echo "36-45 : $group4"
+        echo "46-55 : $group5"
+        echo "56-65 : $group6"
+        echo "66-75 : $group7"
+        echo "76-85 : $group8"
+        echo "86-95 : $group9"
+        echo "96-105: $group10"
+        echo ">105  : $group11"
+        if [ $groupNone -gt 0 ];
+        then echo "None  : $groupNone"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=10000
+
+        makeLine $group0 $defaultWidth "/" "0-5   "
+        makeLine $group1 $defaultWidth "/" "6-15  "
+        makeLine $group2 $defaultWidth "/" "16-25 "
+        makeLine $group3 $defaultWidth "/" "26-35 "
+        makeLine $group4 $defaultWidth "/" "36-45 "
+        makeLine $group5 $defaultWidth "/" "46-55 "
+        makeLine $group6 $defaultWidth "/" "56-65 "
+        makeLine $group7 $defaultWidth "/" "66-75 "
+        makeLine $group8 $defaultWidth "/" "76-85 "
+        makeLine $group9 $defaultWidth "/" "86-95 "
+        makeLine $group10 $defaultWidth "/" "96-105"
+        makeLine $group11 $defaultWidth "/" ">105  "
+
+        if [ $groupNone -gt 0 ]; then
+            makeLine $groupNone $defaultWidth "/" "None  "
+        fi
+    else
+        max=$(findMax $group0 $group1)
+        max=$(findMax $max $group2)
+        max=$(findMax $max $group3)
+        max=$(findMax $max $group4)
+        max=$(findMax $max $group5)
+        max=$(findMax $max $group6)
+        max=$(findMax $max $group7)
+        max=$(findMax $max $group8)
+        max=$(findMax $max $group9)
+        max=$(findMax $max $group10)
+        max=$(findMax $max $group11)
+        max=$(findMax $max $groupNone)
+        change=$(calc $graphWidth/$max)
+
+        makeLine $group0 $change "*" "0-5   "
+        makeLine $group1 $change "*" "6-15  "
+        makeLine $group2 $change "*" "16-25 "
+        makeLine $group3 $change "*" "26-35 "
+        makeLine $group4 $change "*" "36-45 "
+        makeLine $group5 $change "*" "46-55 "
+        makeLine $group6 $change "*" "56-65 "
+        makeLine $group7 $change "*" "66-75 "
+        makeLine $group8 $change "*" "76-85 "
+        makeLine $group9 $change "*" "86-95 "
+        makeLine $group10 $change "*" "96-105"
+        makeLine $group11 $change "*" ">105  "
+        
+        if [ $groupNone -gt 0 ]; then
+            makeLine $groupNone $change "*" "None  "
+        fi
+    fi;;
+    "daily")
+    if [ "$graphWidth" == "" ]; then
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | awk -F ',' 'NR==1{ print \$2 }'")
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        while [ "$date" != "" ]
+        do
+            dailyCases=$(eval "$filterInput | awk -F ',' '{ if(\$2 == \"$date\") { print } }' | wc -l")
+            echo "$date: $dailyCases"
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ];
+        then echo "None : $noneDates"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=500
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | awk -F ',' 'NR==1{ print \$2 }'")
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        while [ "$date" != "" ]
+        do
+            dailyCases=$(eval "$filterInput | awk -F ',' '{ if(\$2 == \"$date\") { print } }' | wc -l")
+            makeLine $dailyCases $defaultWidth "/" "$date"
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $defaultWidth "/" "None"
+        fi
+    else
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | awk -F ',' 'NR==1{ print \$2 }'")
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        max=$(eval "$filterInput | awk -F ',' '{ if(\$2 == \"$date\") { print } }' | wc -l")
+
+        while [ "$date" != "" ]
+        do
+            dailyCases=$(eval "$filterInput | awk -F ',' '{ if(\$2 == \"$date\") { print } }' | wc -l")
+            max=$(findMax $max $dailyCases)
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        done
+        change=$(calc $graphWidth/$max)
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | awk -F ',' 'NR==1{ print \$2 }'")
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        while [ "$date" != "" ]
+        do
+            dailyCases=$(eval "$filterInput | awk -F ',' '{ if(\$2 == \"$date\") { print } }' | wc -l")
+            makeLine $dailyCases $change "*" "$date"
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date\") { print \$2 } }' | head -n 1")
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $change "*" "None"       
+        fi
+    fi;;
+    "monthly")
+    if [ "$graphWidth" == "" ]; then
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%???}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:7}
+        while [ "$date" != "" ]
+        do
+            monthlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            echo "$date: $monthlyCases"
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:7}
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ];
+        then echo "None : $noneDates"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=10000
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%???}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:7}
+        while [ "$date" != "" ]
+        do
+            monthlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            makeLine $monthlyCases $defaultWidth "/" "$date"                   
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:7}
+        done
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $defaultWidth "/" "None"                   
+        fi
+    else
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%???}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:7}
+        max=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+        while [ "$date" != "" ]
+        do
+            monthlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            max=$(findMax $max $monthlyCases)
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:7}
+        done
+        change=$(calc $graphWidth/$max)
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%???}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:7}
+        while [ "$date" != "" ]
+        do
+            monthlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            makeLine $monthlyCases $change "*" "$date"                   
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:7}
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $change "*" "None"                   
+        fi
+    fi;;
+    "yearly")
+    if [ "$graphWidth" == "" ]; then
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%??????}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:4}
+        while [ "$date" != "" ]
+        do
+            yearlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            echo "$date: $yearlyCases"
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:4}
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ];
+        then echo "None : $noneDates"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=100000
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%??????}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:4}
+        while [ "$date" != "" ]
+        do
+            yearlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            makeLine $yearlyCases $defaultWidth "/" "$date"                   
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:4}
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $defaultWidth "/" "None"            
+        fi
+    else
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%??????}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:4}
+        max=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+        while [ "$date" != "" ]
+        do
+            yearlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            max=$(findMax $max $yearlyCases)
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:4}
+        done
+        change=$(calc $graphWidth/$max)
+
+        date=$(eval "$filterInput | awk -F ',' '{ if((NF >= 2) && (\$2 != \"\")) { print } }' | head -n 1 | awk -F ',' 'NR==1{ print \$2 }'")
+        date=${date%??????}
+        nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+        nextDate=${nextDate:0:4}
+        while [ "$date" != "" ]
+        do
+            yearlyCases=$(eval "$filterInput | awk -F ',' '{ if((\$2 > \"$date\") && (\$2 < \"$date.9\")) { print } }' | wc -l")
+            makeLine $yearlyCases $change "*" "$date"                   
+            date=$nextDate
+            nextDate=$(eval "$filterInput | awk -F ',' '{ if(\$2 > \"$date.9\") { print \$2 } }' | head -n 1")
+            nextDate=${nextDate:0:4}
+        done
+
+        noneDates=$(eval "$filterInput | awk -F ',' '{ if((NF < 2) || (\$2 == \"\")) { print } }' | wc -l")
+        if [ $noneDates -gt 0 ]; then
+            makeLine $noneDates $change "*" "None"
+        fi
+    fi;;
+    "countries")
+    if [ "$graphWidth" == "" ]; then
+        foreign="$filterInput | awk -F ',' '{ if((NF >= 8) && ((\$8 != \"CZ\") || (\$8 != \"\"))) { print } }'"
+        eval "$foreign | awk -F ',' -v OFS=': ' '{h[\$8]++}; END { for(k in h) if((k != \"\") && (k != \"CZ\")) {print k, h[k]} }'"
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=100
+
+        foreign="$filterInput | awk -F ',' '{ if((NF >= 8) && ((\$8 != \"CZ\") || (\$8 != \"\"))) { print } }'"
+        list="$foreign | awk -F ',' -v OFS=': ' '{h[\$8]++}; END { for(k in h) {if((k != \"\") && (k != \"CZ\")) {print k, h[k]}} }'"
+        eval $list | while read country count; do
+            country=${country::-1}
+            makeLine $count $defaultWidth "/" "$country"            
+        done
+    else
+        foreign="$filterInput | awk -F ',' '{ if((NF >= 8) && ((\$8 != \"CZ\") || (\$8 != \"\"))) { print } }'"
+        list="$foreign | awk -F ',' -v OFS=': ' '{h[\$8]++}; END { for(k in h) {if((k != \"\") && (k != \"CZ\")) {print k, h[k]}} }'"
+        max=0
+        while read country count; do
+            max=$(findMax $max $count)        
+        done <<< "$(eval "$list")"
+        change=$(calc $graphWidth/$max)
+
+        eval $list | while read country count; do
+            country=${country::-1}
+            makeLine $count $change "*" "$country"            
+        done
+    fi;;
+    "districts")
+    if [ "$graphWidth" == "" ]; then
+        district="$filterInput | awk -F ',' '{ if((NF >= 6) && (\$6 != \"\")) { print } }'"
+        eval "$district | awk -F ',' -v OFS=': ' '{h[\$6]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 6) || (\$6 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ];
+        then echo "None : $noneCount"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=1000
+
+        district="$filterInput | awk -F ',' '{ if((NF >= 6) && (\$6 != \"\")) { print } }'"
+        list="$district | awk -F ',' -v OFS=': ' '{h[\$6]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+        eval $list | while read district count; do
+            district=${district::-1}
+            makeLine $count $defaultWidth "/" "$district"            
+        done
+
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 6) || (\$6 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ]; then
+            makeLine $noneCount $defaultWidth "/" "None"            
+        fi
+    else
+        district="$filterInput | awk -F ',' '{ if((NF >= 6) && (\$6 != \"\")) { print } }'"
+        list="$district | awk -F ',' -v OFS=': ' '{h[\$6]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+
+        max=0
+        while read district count; do
+            max=$(findMax $max $count)        
+        done <<< "$(eval "$list")"
+        change=$(calc $graphWidth/$max)
+
+        eval $list | while read district count; do
+            district=${district::-1}
+            makeLine $count $change "*" "$district"            
+        done
+
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 6) || (\$6 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ]; then
+            makeLine $noneCount $change "*" "None"
+        fi
+    fi;;
+    "regions")
+    if [ "$graphWidth" == "" ]; then
+        region="$filterInput | awk -F ',' '{ if((NF >= 5) && (\$5 != \"\")) { print } }'"
+        eval "$region | awk -F ',' -v OFS=': ' '{h[\$5]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 5) || (\$5 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ];
+        then echo "None : $noneCount"
+        fi
+    elif [ "$graphWidth" == "default" ]; then
+        defaultWidth=10000
+
+        region="$filterInput | awk -F ',' '{ if((NF >= 5) && (\$5 != \"\")) { print } }'"
+        list="$region | awk -F ',' -v OFS=': ' '{h[\$5]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+
+        eval $list | while read region count; do
+            region=${region::-1}
+            makeLine $count $defaultWidth "/" "$region"            
+        done
+
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 5) || (\$5 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ]; then
+            makeLine $noneCount $defaultWidth "/" "None"            
+        fi
+    else
+        region="$filterInput | awk -F ',' '{ if((NF >= 5) && (\$5 != \"\")) { print } }'"
+        list="$region | awk -F ',' -v OFS=': ' '{h[\$5]++}; END { for(k in h) print k, h[k] }' | sort -k 1"
+
+        max=0
+        while read region count; do
+            max=$(findMax $max $count)        
+        done <<< "$(eval "$list")"
+        change=$(calc $graphWidth/$max)
+
+        eval $list | while read region count; do
+            region=${region::-1}
+            makeLine $count $change "*" "$region"            
+        done
+
+        noneCount=$(eval "$filterInput | awk -F ',' '{ if(((NF < 5) || (\$5 == \"\"))) { print } }' | wc -l")
+        if [ $noneCount -gt 0 ]; then
+            makeLine $noneCount $change "*" "None"            
+        fi
+    fi;;
+esac
+
+exit 0
